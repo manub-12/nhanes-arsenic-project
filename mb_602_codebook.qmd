@@ -1,0 +1,141 @@
+---
+title: "PQHS 602 - Codebook"
+author: "Manu Bulusu"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: lux
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+options(error = recover)
+
+library(janitor) 
+library(naniar)
+
+library(broom)
+library(caret)
+library(car)
+library(codebookr)
+library(mice)
+library(gt)
+library(patchwork)
+library(rms)
+library(mosaic)
+library(haven)
+library(readr)
+library(transplantr)
+library(tableone)
+library(nhanesA)
+library(conflicted)
+library(webshot2)
+
+library(easystats)
+library(tidyverse) 
+
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("max", "base")
+
+theme_set(theme_bw()) 
+```
+
+# Load Data
+
+```{r}
+studysample <- readRDS("mb_602_data_final.Rds")
+```
+
+```{r}
+glimpse(studysample)
+```
+
+
+# Codebook
+
+| Variable | Role | Type | Description |
+|-----------------:|:----------------:|:----------------:|:-----------------|
+| `NHANES_ID` | identifier | \- | Unique subject identifier for unified NHANES data, consists of survey cycle appended to original NHANES id (SEQN) |
+| `age` | predictor | quantitative | Subject age - *years* |
+| `sex` | predictor | binary | Subject sex - *Male, Female* |
+| `ethnicity` | predictor | multi-categorical | Subject ethnicity - *Mexican American, Other Hispanic, Non-Hispanic White, Non-Hispanic Black, Other Race - Including Multi-Racial* |
+| `prostate_cancer` | outcome | binary | Has subject been diagnosed with prostate cancer - *Yes, No* |
+| `mort_status` | outcome | binary | Subject all-cause mortality status, as reported in LMF data - *0 = Censored (Alive or Lost to Follow-up), 1 = Event Observed (Deceased)* |  
+| `arsenic_total` | predictor | quantitative | Subject urinary arsenic, total - *ug/L* |
+| `arsenic_mma` | predictor | quantitative | Subject urinary monomethylarsonic acid - *ug/L* |
+| `arsenic_dma` | predictor | quantitative | Subject urinary dimethylarsonic acid - *ug/L* |
+| `arsenic_asb` | predictor | quantitative | Subject urinary arsenobetaine - *ug/L* |
+| `highest_ed` | predictor | multi-categorical | Subject highest education level achieved - *No High School Diploma, High School Graduate or GED, Some College or AA Degree, College Graduate* |
+| `smoking` | predictor | binary | Has subject smoked at least 100 cigarettes in lifetime - *Yes, No* |
+| `diabetes` | predictor | binary | Has subject been told they have diabetes by physician - *Yes, No* |
+| `hypertension` | predictor | multi-categorical | Based on average blood pressure, does subject have hypertension - *Yes, No, Missing* |
+| `bmi` | predictor | quantitative | Subject body mass index - *kg/m^2* |
+| `acr` | predictor | quantitative | Subject albumin-creatinine ratio - *mg/g* |
+| `eGFR` | predictor | quantitative | Subject estimated glomerular filtration rate - *mL/min/1.73 m^2* |
+| `urine_cr` | predictor | quantitative | Subject urinary creatinine - *mg/dL* |
+| `ELIGSTAT` | indicator | \- | Indicator of subject LMF eligibility, ensuring mortality data is available |
+| `PERMTH_EXM` | outcome | quantitative | Time in person-months from subject examination to observed mortality event (specified by `mort_status`) |
+
+
+
+# Numerical Description
+
+```{r}
+numerical_summary <- data_codebook(studysample) |>
+  mutate(
+    Description = case_when(
+      Name == "NHANES_ID" ~ "Unique subject identifier for unified NHANES data, consists of survey cycle appended to original NHANES id (SEQN)",
+      Name == "age" ~ "Subject age - years",
+      Name == "sex" ~ "Subject sex",
+      Name == "ethnicity" ~ "Subject ethnicity",
+      Name == "prostate_cancer" ~ "Has subject been diagnosed with prostate cancer?",
+      Name == "mort_status" ~ "Subject all-cause mortality status, as reported in LMF data - 0 = Censored (Alive or Lost to Follow-up), 1 = Event Observed (Deceased)",
+      Name == "arsenic_total" ~ "Subject urinary arsenic, total - ug/L",
+      Name == "arsenic_mma" ~ "Subject urinary monomethylarsonic acid - ug/L",
+      Name == "arsenic_dma" ~ "Subject urinary dimethylarsonic acid - ug/L",
+      Name == "arsenic_asb" ~ "Subject urinary arsenobetaine - ug/L",
+      Name == "highest_ed" ~ "Subject highest education level achieved",
+      Name == "smoking" ~ "Has subject smoked at least 100 cigarettes in lifetime?",
+      Name == "diabetes" ~ "Has subject been told they have diabetes by physician?",
+      Name == "hypertension" ~ "Based on average blood pressure, does subject have hypertension?",
+      Name == "bmi" ~ "Subject body mass index - kg/m^2",
+      Name == "acr" ~ "Subject albumin-creatinine ratio - mg/g",
+      Name == "eGFR" ~ "Subject estimated glomerular filtration rate - mL/min/1.73 m^2",
+      Name == "urine_cr" ~ "Subject urinary creatinine - mg/dL",
+      Name == "ELIGSTAT" ~ "Indicator of subject LMF eligibility, ensuring mortality data is available",
+      Name == "PERMTH_EXM" ~ "Time in person-months from subject examination to observed mortality event (specified by mort_status)",
+      .default = ""
+    )
+  ) |>
+  select(Name, Description, Type, Values, N, Prop, Missings) |>
+  gt(rowname_col = "row") |>
+  cols_align(
+    align = "center",
+    columns = c(Type, Missings, Values, N, Prop)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12))
+
+numerical_summary
+gtsave(numerical_summary, "numerical_summary.png")
+```
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```

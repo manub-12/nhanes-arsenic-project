@@ -1,0 +1,1186 @@
+---
+title: "PQHS 602 - Final Study Dataset"
+author: "Manu Bulusu"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: lux
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+options(error = recover)
+
+library(janitor) 
+library(naniar)
+
+library(broom)
+library(caret)
+library(car)
+library(codebookr)
+library(mice)
+library(gt)
+library(patchwork)
+library(rms)
+library(mosaic)
+library(haven)
+library(readr)
+library(transplantr)
+library(tableone)
+library(nhanesA)
+library(conflicted)
+
+library(easystats)
+library(tidyverse) 
+
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("max", "base")
+
+theme_set(theme_bw()) 
+```
+
+# NHANES Dataset Ingest
+
+First, I will obtain the NHANES data tables containing my study variables of interest. Since I am analyzing data across multiple survey cycles, I will begin by merging all relevant data tables within each cycle into a single dataset and then extracting only my study variables. I will also extract the NCHS linked mortality files (LMF) for each survey cycle and merge them to the NHANES tables via SEQN to obtain mortality data for applicable subjects.
+
+Because the `SEQN` identifier can be reused across different cycles, I will then create a new unique subject variable `ID` by appending each participant’s `SEQN` to their survey cycle (e.g., “2017–2018_SEQN”).
+
+The following code chunks accomplish the steps above for each of the following survey cycles:
+
+-   2017-2018
+-   2015-2016
+-   2013-2014
+-   2011-2012
+-   2009-2010
+-   2007-2008
+-   2005-2006
+-   2003-2004
+
+```{r}
+### ------------------------------
+### 2017–2018 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_J') |> tibble() |> dplyr::select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+  
+arsenic_total <- nhanes('UTAS_J') |> tibble() |> select(SEQN,
+                                                        URXUAS)
+
+arsenic_speciated <- nhanes('UAS_J') |> tibble() |> select(SEQN,
+                                                           URXUMMA,
+                                                           URXUDMA,
+                                                           URXUAB,
+                                                           WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_J') |> tibble() |> select(SEQN,
+                                                             URXUCR,
+                                                             URDACT)
+
+smoking <- nhanes('SMQ_J') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+
+body_measures <- nhanes('BMX_J') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_J') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_J') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_J') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_J') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_J') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2017_2018_MORT_2019_PUBLIC.dat"
+srvyout <- "NHANES_2017_2018"
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2017_2018 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(arsenic_speciated, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2017_2018, by = "SEQN") |>
+  mutate(
+    cycle = "2017_2018",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+The code used above for 2017-2018 is reused for each of the remaining cycles:
+
+```{r}
+### ------------------------------
+### 2015–2016 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_I') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+  
+arsenic_total <- nhanes('UTAS_I') |> tibble() |> select(SEQN,
+                                                        URXUAS)
+
+arsenic_speciated <- nhanes('UAS_I') |> tibble() |> select(SEQN,
+                                                           URXUMMA,
+                                                           URXUDMA,
+                                                           URXUAB,
+                                                           WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_I') |> tibble() |> select(SEQN,
+                                                             URXUCR,
+                                                             URDACT)
+
+smoking <- nhanes('SMQ_I') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_I') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_I') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_I') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_I') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_I') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_I') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2015_2016_MORT_2019_PUBLIC.dat"
+srvyout <- "NHANES_2015_2016" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2015_2016 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(arsenic_speciated, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2015_2016, by = "SEQN") |>
+  mutate(
+    cycle = "2015_2016",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+```{r}
+### ------------------------------
+### 2013–2014 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_H') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+  
+arsenic_total <- nhanes('UTAS_H') |> tibble() |> select(SEQN,
+                                                        URXUAS)
+
+arsenic_speciated <- nhanes('UAS_H') |> tibble() |> select(SEQN,
+                                                           URXUMMA,
+                                                           URXUDMA,
+                                                           URXUAB,
+                                                           WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_H') |> tibble() |> select(SEQN,
+                                                             URXUCR,
+                                                             URDACT)
+
+smoking <- nhanes('SMQ_H') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_H') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_H') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_H') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_H') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_H') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_H') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2013_2014_MORT_2019_PUBLIC.dat"   
+srvyout <- "NHANES_2013_2014" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2013_2014 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(arsenic_speciated, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2013_2014, by = "SEQN") |>
+  mutate(
+    cycle = "2013_2014",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+```{r}
+### ------------------------------
+### 2011–2012 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_G') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+
+arsenic_total <- nhanes('UAS_G') |> tibble() |> select(SEQN, 
+                                                 URXUAS,
+                                                 URXUMMA,
+                                                 URXUDMA,
+                                                 URXUAB,
+                                                 WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_G') |> tibble() |> select(SEQN,
+                                                             URXUCR,
+                                                             URDACT)
+
+smoking <- nhanes('SMQ_G') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_G') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_G') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_G') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_G') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_G') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_G') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2011_2012_MORT_2019_PUBLIC.dat"   
+srvyout <- "NHANES_2011_2012" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2011_2012 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2011_2012, by = "SEQN") |>
+  mutate(
+    cycle = "2011_2012",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+```{r}
+### ------------------------------
+### 2009–2010 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_F') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+
+arsenic_total <- nhanes('UAS_F') |> tibble() |> select(SEQN, 
+                                                 URXUAS,
+                                                 URXUMMA,
+                                                 URXUDMA,
+                                                 URXUAB,
+                                                 WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_F') |> tibble() |> select(SEQN,
+                                                             URXUCR,
+                                                             URDACT)
+
+smoking <- nhanes('SMQ_F') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_F') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_F') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_F') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_F') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_F') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_F') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2009_2010_MORT_2019_PUBLIC.dat"  
+srvyout <- "NHANES_2009_2010" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2009_2010 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2009_2010, by = "SEQN") |>
+  mutate(
+    cycle = "2009_2010",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+For all datasets before 2009-2010, an additional step is taken to calculate the albumin-to-creatinine ratio, which is not already available as the variable `URDACT`. To calculate `URDACT`, I used the formula `URDACT = (URXUMS * 1/10) / (URXUCR * 1/1000)` to obtain the ACR in mg/g.
+
+```{r}
+### ------------------------------
+### 2007–2008 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_E') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+
+arsenic_total <- nhanes('UAS_E') |> tibble() |> select(SEQN, 
+                                                 URXUAS,
+                                                 URXUMMA,
+                                                 URXUDMA,
+                                                 URXUAB,
+                                                 WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_E') |> tibble() |>
+  mutate(URDACT = (URXUMS/10) / (URXUCR/1000)) |>
+  select(SEQN, URXUCR, URDACT)
+
+smoking <- nhanes('SMQ_E') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_E') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_E') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_E') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_E') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_E') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_E') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2007_2008_MORT_2019_PUBLIC.dat"  
+srvyout <- "NHANES_2007_2008" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2007_2008 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2007_2008, by = "SEQN") |>
+  mutate(
+    cycle = "2007_2008",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+```{r}
+### ------------------------------
+### 2005–2006 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_D') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+
+arsenic_total <- nhanes('UAS_D') |> tibble() |> select(SEQN, 
+                                                 URXUAS,
+                                                 URXUMMA,
+                                                 URXUDMA,
+                                                 URXUAB,
+                                                 WTSA2YR)
+
+albumin_creatine <- nhanes('ALB_CR_D') |> tibble() |>
+  mutate(URDACT = (URXUMS/10) / (URXUCR/1000)) |>
+  select(SEQN, URXUCR, URDACT)
+
+smoking <- nhanes('SMQ_D') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+body_measures <- nhanes('BMX_D') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_D') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_D') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('BIOPRO_D') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_D') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_D') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2005_2006_MORT_2019_PUBLIC.dat"
+srvyout <- "NHANES_2005_2006" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2005_2006 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2005_2006, by = "SEQN") |>
+  mutate(
+    cycle = "2005_2006",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+```{r}
+### ------------------------------
+### 2003–2004 Cycle
+### ------------------------------
+
+### NHANES Data 
+demo <- nhanes('DEMO_C') |> tibble() |> select(SEQN,
+                                               SDDSRVYR,
+                                               RIDAGEYR,
+                                               RIAGENDR,
+                                               RIDRETH1,
+                                               RIDEXPRG,
+                                               DMDEDUC2)
+
+arsenic_total <- nhanes('L06UAS_C') |> tibble() |> select(SEQN, 
+                                                 URXUAS,
+                                                 URXUMMA,
+                                                 URXUDMA,
+                                                 URXUAB,
+                                                 WTSA2YR)
+
+albumin_creatine <- nhanes('L16_C') |> tibble() |>
+  mutate(URDACT = (URXUMASI/10) / (URXUCR/1000)) |>
+  select(SEQN, URXUCR, URDACT)
+
+smoking <- nhanes('SMQ_C') |> tibble() |> select(SEQN,
+                                                 SMQ020)
+
+
+body_measures <- nhanes('BMX_C') |> tibble() |> select(SEQN,
+                                                       BMXBMI)
+
+diabetes <- nhanes('DIQ_C') |> tibble() |> select(SEQN,
+                                                  DIQ010)
+
+blood_pressure <- nhanes('BPX_C') |> tibble() |> select(SEQN,
+                                                        BPXSY1,
+                                                        BPXSY2,
+                                                        BPXSY3,
+                                                        BPXSY4,
+                                                        BPXDI1,
+                                                        BPXDI2,
+                                                        BPXDI3,
+                                                        BPXDI4)
+
+egfr <- nhanes('L40_C') |> tibble() |> select(SEQN,
+                                                 LBXSCR)
+
+medical <- nhanes('MCQ_C') |> tibble() |> select(SEQN,
+                                                 MCQ220,
+                                                 MCQ230A,
+                                                 MCQ230B,
+                                                 MCQ230C)
+
+pregnant <- nhanes('RHQ_I') |> tibble() |> select(SEQN,
+                                                  RHD143)
+
+### LMF Data
+srvyin <- "https://ftp.cdc.gov/pub/Health_Statistics/NCHS/datalinkage/linked_mortality/NHANES_2003_2004_MORT_2019_PUBLIC.dat"
+srvyout <- "NHANES_2003_2004" 
+
+dsn <- read_fwf(file=srvyin,
+                col_types = "iiiiiiii",
+                fwf_cols(SEQN = c(1,6),
+                         ELIGSTAT = c(15,15),
+                         MORTSTAT = c(16,16),
+                         UCOD_LEADING = c(17,19),
+                         DIABETES = c(20,20),
+                         HYPERTEN = c(21,21),
+                         PERMTH_INT = c(43,45),
+                         PERMTH_EXM = c(46,48)
+                ),
+                na = c("", ".")
+)
+
+assign(paste0(srvyout), dsn)
+rm(dsn, srvyin, srvyout)
+
+### Merged Data
+data_2003_2004 <- demo |>
+  full_join(arsenic_total, by = "SEQN") |>
+  full_join(albumin_creatine, by = "SEQN") |>
+  full_join(smoking, by = "SEQN") |>
+  full_join(body_measures, by = "SEQN") |>
+  full_join(diabetes, by = "SEQN") |>
+  full_join(blood_pressure, by = "SEQN") |>
+  full_join(egfr, by = "SEQN") |>
+  full_join(medical, by = "SEQN") |>
+  full_join(pregnant, by = "SEQN") |>
+  full_join(NHANES_2003_2004, by = "SEQN") |>
+  mutate(
+    cycle = "2003_2004",
+    NHANES_ID = paste0(cycle, "_", SEQN)
+  )
+```
+
+At this point, I now have 8 datasets representing each survey cycle from 2003 to 2018. Each data set contains the same 42 variables, while all subjects across every cycle have a new unique ID without repeats.
+
+Now, I will combine the data from all 8 cycles into a single study dataset:
+
+```{r}
+### ------------------------------
+### Combine All Cycles
+### ------------------------------
+
+nhanes_combined <- bind_rows(
+  data_2017_2018,
+  data_2015_2016,
+  data_2013_2014,
+  data_2011_2012,
+  data_2009_2010,
+  data_2007_2008,
+  data_2005_2006,
+  data_2003_2004
+)
+
+keep <- c("nhanes_combined")
+rm(list = setdiff(ls(), keep))
+ls()
+```
+
+The following code summarizes the new combined dataset, `nhanes_combined`:
+
+```{r}
+describe(nhanes_combined)
+```
+
+As shown above, I now have 83783 individual subjects across all 8 survey cycles (denoted by the variable `NHANES_ID`).
+
+# Cleaning the Study Dataset
+
+## Subject Eligibility
+
+Before proceeding, I will first remove any ineligible participants from the data, as per the study requirements.
+
+Removing pregnant subjects:
+
+```{r}
+## Pregnant subjects
+nhanes_combined <- nhanes_combined |>
+  filter(!(RIDEXPRG %in% c("Yes, positive lab pregnancy test or self-reported pregnant at exam"))) 
+```
+
+Removing subjects ineligible for LMF. Eligible subjects have an `ELIGSTAT` value of 1, all other subjects will be removed:
+
+```{r}
+## subjects ineligible for LMF
+nhanes_combined <- nhanes_combined |>
+  filter(ELIGSTAT == 1)
+```
+
+
+## Fixing Study Variables
+
+### eGFR Covariate
+
+I will now process and clean `nhanes_combined` to prepare it for analysis. First, I will create a new study variable `eGFR` to be included in the data as a covariate. The values for eGFR are obtained using a helper function to calculate eGFR based on subjects' serum creatinine (mg/dL), age, sex and ethnicity using the CKD-EPI equation. The helper function necessitates some changes made to the variables for sex and ethnicity, which are made below before calculating the eGFR:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    sex_ckd = case_when(
+      RIAGENDR == "Male" ~ "M",
+      RIAGENDR == "Female" ~ "F"
+    ),
+    eth_ckd = case_when(
+      RIDRETH1 == "Non-Hispanic Black" ~ "black",
+      TRUE ~ "non-black"
+    )
+  ) |>
+  mutate(eGFR = ckd_epi(creat = LBXSCR, age = RIDAGEYR, sex = sex_ckd, eth = eth_ckd, units = "US"))
+
+describe(nhanes_combined$eGFR)
+```
+
+Note that the dummy variables for sex and ethnicity are created here just for obtaining the eGFR, and will not be used later on in the study.
+
+### Hypertension Covariate
+
+Next, I want to make an binary variable for hypertension. I have already extracted 8 variables from the NHANES data, 4 indicating 4 separate readings of systolic blood pressure (`BPXSY1` through `BPXSY4`) and the other 4 indicating the same for diastolic blood pressure (`BPXDI1` through `BPXDI4`). To create my hypertension variable, I will first calculate the average systolic blood pressure and average diastolic blood pressure from their respective 4 readings for each subject. Then, I will use the following rule to assign a value to my new hypertension variable:
+
+`hypertension` = "Yes" if:
+
+-   avg systolic \>= 130 mmHg or
+-   avg diastolic \>= 80 mmHg
+
+Otherwise, it will equal "No".
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    mean_sbp = rowMeans(across(c(BPXSY1, BPXSY2, BPXSY3, BPXSY4)), na.rm = TRUE),
+    mean_dbp = rowMeans(across(c(BPXDI1, BPXDI2, BPXDI3, BPXDI4)), na.rm = TRUE),
+    hypertension = case_when(
+      !is.na(mean_sbp) & (mean_sbp >= 130 | mean_dbp >= 90) ~ "Yes",
+      !is.na(mean_sbp) & (mean_sbp < 130 & mean_dbp < 90) ~ "No",
+      TRUE ~ "Missing"
+    )
+  ) |>
+  mutate(hypertension = factor(hypertension, levels = c("No", "Yes", "Missing")))
+
+describe(nhanes_combined$hypertension)
+```
+
+### Prostate Cancer Outcomes
+
+Next, I will focus on the study outcome for prostate cancer prevalence in subjects. I will first view the number of occurrences of prostate cancer diagnoses using the 3 NHANES variables for site-specific cancer history-`MCQ230A`, `MCQ230B`, and `MCQ230C`, representing the first, second, and third cancers experienced by each subject respectively (where applicable):
+
+```{r}
+nhanes_combined |>
+  dplyr::select(MCQ230A, MCQ230B, MCQ230C) |>
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Response") |>
+  filter(Response %in% c("Prostate")) |>
+  dplyr::count(Variable, Response) |>
+  pivot_wider(names_from = Response, values_from = n, values_fill = 0)
+```
+
+As shown above, there are 690 occurrences of prostate cancer. I now want to create a binary variable indicating prostatewas present at any time per subject. The following code accomplishes the creation of the binary outcome variable, `prostate_cancer`:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    # First classify any cancer
+    any_cancer = case_when(
+      MCQ220 == "Yes" ~ "Yes",
+      MCQ220 == "No"  ~ "No",
+      TRUE            ~ NA_character_
+    ),
+
+    # Prostate cancer only applies if they reported ANY cancer
+    prostate_cancer = case_when(
+      any_cancer == "Yes" & (MCQ230A == "Prostate" |
+                             MCQ230B == "Prostate" |
+                             MCQ230C == "Prostate") ~ "Yes",
+
+      any_cancer == "Yes" ~ "No",      # Has cancer but not prostate cancer
+      any_cancer == "No"  ~ "No",      # No cancers reported
+      TRUE                ~ NA_character_
+    )
+  ) |>
+  mutate(
+    any_cancer = factor(any_cancer),
+    prostate_cancer = factor(prostate_cancer)
+  )
+
+
+describe(nhanes_combined$prostate_cancer)
+```
+
+The summaries above and below now show the number of individual subjects who have experienced prostate cancer, 690 subjects.
+
+```{r}
+table(nhanes_combined$prostate_cancer)
+```
+
+
+### Mortality Outcomes
+
+Now, I will need to prepare my LMF data to reflect the mortality outcomes I want to study in my analysis. Because I want to study all-cause mortality, I will keep the `MORTSTAT` variable from the LMF data as is to indicate all-cause mortality status, with `0` indicating "Assumed alive" and `1` indicating "Assumed deceased.
+
+```{r}
+table(nhanes_combined$MORTSTAT)
+```
+
+### Categorical Variables
+
+I will now address the categorical study variables in my data set. Firstly, I would like to drop all subject response categories corresponding to "Don't Know" and "Refused" responses for the respective survey questions:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  filter(!(DMDEDUC2 %in% c("Don't know", "Don't Know", "Refused"))) |>
+  filter(!(SMQ020 %in% c("Don't know", "Refused"))) |>
+  filter(!(DIQ010 %in% c("Don't know", "Refused")))
+```
+
+Next, I will combine redundant factor levels in `DMDEDUC2` (as it contains levels that are semantically different across cycles but represent the same values) and rename them for ease in interpretation. I will also remove unused levels from all categorical variables:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    DMDEDUC2 = fct_collapse(
+      DMDEDUC2,
+      NoHSDiploma = c("Less than 9th grade", "9-11th grade (Includes 12th grade with no diploma)", "Less Than 9th Grade", "9-11th Grade (Includes 12th grade with no diploma)"),
+      HSGraduate_or_GED = c("High school graduate/GED or equivalent", "High School Grad/GED or Equivalent"),
+      SomeCollege_or_AADegree = c("Some college or AA degree", "Some College or AA degree"),
+      CollegeGraduate = c("College Graduate or above", "College graduate or above")
+    ),
+    SMQ020 = fct_relevel(SMQ020, "No"),
+    DMDEDUC2 = fct_drop(DMDEDUC2),
+    SMQ020 = fct_drop(SMQ020),
+    DIQ010 = fct_drop(DIQ010)
+  )
+```
+
+I will also combine the "Borderline" and "No" response categories for the diabetes status variable `DIQ010`:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    DIQ010 = fct_collapse(
+      DIQ010,
+      No = c("No", "Borderline"),
+      Yes = c("Yes")
+    ),
+    DIQ010 = fct_relevel(DIQ010, "No"),
+    DIQ010 = fct_drop(DIQ010)
+  )
+```
+
+
+Finally, I will create a new categorical variable from `SDDSRVYR`, the NHANES variable representing survey cycle. I would like to trim down the original labels to only show the duration by years (e.g. "2017-2018") in the new factor variable `cycle`:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  mutate(
+    cycle = str_extract(SDDSRVYR, "\\d{4}-\\d{4}"),
+    cycle = factor(cycle)
+  )
+
+describe(nhanes_combined$cycle)
+```
+
+The table above shows the proportion of subjects from each survey cycle, in the unified dataset. Notably, the number of subjects in each cycle are very similar.
+
+## Renaming Study Variables
+
+I will now rename all study variables in my data set to make analysis and interpretation easier:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  rename(
+    mort_status = MORTSTAT,
+    arsenic_total = URXUAS,
+    arsenic_mma = URXUMMA,
+    arsenic_dma = URXUDMA,
+    arsenic_asb = URXUAB,
+    acr = URDACT,
+    age = RIDAGEYR,
+    sex = RIAGENDR,
+    ethnicity = RIDRETH1,
+    highest_ed = DMDEDUC2,
+    smoking = SMQ020,
+    bmi = BMXBMI,
+    diabetes = DIQ010,
+    urine_cr = URXUCR
+  )
+```
+
+## Arranging Variables
+
+Finally, I will filter out variables that will not be used in the final analysis, and rearrange the remaining ones so subjects are presented with demographic information, followed by outcome data, primary exposures, secondary exposures, and finally the LMF data.
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  dplyr::select(NHANES_ID, cycle, age, sex, ethnicity, prostate_cancer, mort_status, arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb, highest_ed, smoking, diabetes, hypertension, bmi, acr, eGFR, urine_cr, ELIGSTAT, PERMTH_EXM)
+```
+
+# Missing Data Analysis
+
+## Examining Missing Values
+
+I will now evaluate missing values in my study data. First, a missingness summary for all variables:
+
+```{r}
+miss_var_summary(nhanes_combined)
+```
+
+Firstly, among the primary exposures, there is a large amount of missing data (68.7%) for all urinary arsenic measurements (`arsenic_total`, `arsenic_mma`, `arsenic_dma`, `arsenic_asb`). 
+
+As for the study outcomes, `prostate_cancer` has a small amount of missing values, 6.33%. These correspond to subjects who did not have responses for the NHANES survey questions used to create the cancer outcome variable.
+
+Finally, for the study covariates, several of them have missing values, but most are ~10% or less; I plan to handle these using imputation.
+
+## Managing Missing Data
+
+Firstly, to manage the missing data, I am choosing conduct a complete-case analysis for the outcome variables. Thus, I will first remove all subjects with missing data for `prostate_cancer`:
+  
+```{r}
+nhanes_combined <- nhanes_combined |>
+  filter(complete.cases(prostate_cancer))
+
+nrow(nhanes_combined)
+```
+
+Next, I will need to manage missing values for the primary exposures (`arsenic_total`, `arsenic_mma`, `arsenic_dma`, `arsenic_asb`). Before doing so, I will first view missing exposure values by cycle to see if there are any outliers:
+
+```{r}
+nhanes_combined |>
+  group_by(cycle) |>
+  summarise(
+    arsenic_total_missing = base::mean(is.na(arsenic_total)) * 100,
+    arsenic_mma_missing = base::mean(is.na(arsenic_mma)) * 100,
+    arsenic_asb_missing = base::mean(is.na(arsenic_asb)) * 100,
+    arsenic_dma_missing = base::mean(is.na(arsenic_dma)) * 100,
+  )
+```
+
+Looking above, we can see that the percentage of missing values are fairly uniform across each cycle and very similar to the overall missingness calculated earlier for the combined data (74.1%). 
+
+The reason for this is likely by design: many NHANES laboratory tests are performed on special subsamples rather than the entire study sample. This is confirmed in the codebooks for each cycle's urinary arsenic measurements, stating that "all examined participants aged 3 to 5 years and a one-third subsample of examined participants aged 6 years and older were eligible," for the laboratory testing.
+
+Thus, we can assume that the missingness is NOT informative about the outcome, allowing us to perform a complete-case analysis with the primary arsenic exposure variables as well.
+
+With that said, I will now retain only the subjects with complete data for the arsenic exposures:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  filter(complete.cases(arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb))
+```
+
+
+My final data now has 13529 subjects from the original 83783 NHANES subjects.
+
+Now, re-selecting the final variables to be retained in the dataset, those being only the ones relevant to analysis:
+
+```{r}
+nhanes_combined <- nhanes_combined |>
+  dplyr::select(NHANES_ID, age, sex, ethnicity, prostate_cancer, mort_status, arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb, highest_ed, smoking, diabetes, hypertension, bmi, acr, eGFR, urine_cr, ELIGSTAT, PERMTH_EXM)
+```
+
+
+# Saving Final Study Dataset
+
+I will now save my final study dataset, `602_data_final`, as an RDs file for easier access going forward.
+
+```{r}
+mb_602_data_final <- nhanes_combined
+write_rds(mb_602_data_final, file="mb_602_data_final.Rds")
+```
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```

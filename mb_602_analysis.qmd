@@ -1,0 +1,1936 @@
+---
+title: "mb_602_analysis"
+author: "Manu Bulusu"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: lux
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+options(error = recover)
+
+library(janitor) 
+library(naniar)
+
+library(broom)
+library(bestglm)
+library(caret)
+library(car)
+library(cobalt)
+library(conflicted)
+library(cutpointr)
+library(GGally)
+library(gt)
+library(gtExtras)
+library(mice)
+library(knitr)
+library(MASS)
+library(patchwork)
+library(rms)
+library(mosaic)
+library(haven)
+library(readr)
+library(transplantr)
+library(nhanesA)
+library(nnet)
+library(olsrr)
+library(pROC)
+library(rms)
+library(ROCR)
+library(rsample)
+library(scales)
+library(survey)
+library(survival)
+library(survminer)
+library(glmulti)
+library(leaps)
+library(glmnet)
+library(tableone)
+library(detectseparation)
+library(miselect)
+library(psfmi)
+library(basecamb)
+library(gglasso)
+library(webshot2)
+library(gridExtra)
+
+library(easystats)
+library(tidyverse) 
+
+theme_set(theme_bw()) 
+```
+
+```{r}
+conflicted::conflicts_prefer(pROC::roc,
+                             pROC::auc,
+                             dplyr::select,
+                             dplyr::filter,
+                             )
+```
+
+# Load Data
+
+Loading in my saved study dataset that I created:
+
+```{r}
+studysample <- readRDS("mb_602_data_final.Rds")
+```
+
+# Exploratory Analysis
+
+Will quickly look at the distribution of the primary exposures, which are all quantitative, to determine if transformations are necessary. Looking at total arsenic, monomethylarsonic acid, dimethylarsonic acid, arsenobetaine:
+
+```{r}
+p1 <- ggplot(studysample, aes(x = arsenic_total)) +
+  geom_density() +
+  geom_density(fill = "red", size = 0.5, position = "identity", alpha = 0.5)
+
+p2 <- ggplot(studysample, aes(x = arsenic_mma)) +
+  geom_density() +
+  geom_density(fill = "blue", size = 0.5, position = "identity", alpha = 0.5)
+
+p3 <- ggplot(studysample, aes(x = arsenic_dma)) +
+  geom_density() +
+  geom_density(fill = "green", size = 0.5, position = "identity", alpha = 0.5)
+
+p4 <- ggplot(studysample, aes(x = arsenic_asb)) +
+  geom_density() +
+  geom_density(fill = "magenta", size = 0.5, position = "identity", alpha = 0.5)
+
+grid.arrange(p1,p2,p3,p4, ncol = 2, nrow = 2)
+  
+```
+
+Also looking at albumin-creatinine-ratio and urinary creatinine, the other two quantitative covariates without a meaningful scale (age, bmi, and eGFR will be unchanged):
+
+```{r}
+p5 <- ggplot(studysample, aes(x = acr)) +
+  geom_density() +
+  geom_density(fill = "orange", size = 0.5, position = "identity", alpha = 0.5)
+
+p6 <- ggplot(studysample, aes(x = urine_cr)) +
+  geom_density() +
+  geom_density(fill = "yellow", size = 0.5, position = "identity", alpha = 0.5)
+
+grid.arrange(p5, p6, ncol = 2, nrow = 1)
+```
+
+Based on the graphs above, it seems that all arsenic measurements as well as ACR are heavily right-skewed, so I will log-transform them in all of my analyses going forward. While urinary creatinine is also right-skewed to a lesser extent, I will abstain from transforming it for simplicity of interpretation, and to facilitate the sensitivity analyses involving creatinine later on.
+
+# Prostate Cancer Prevalence
+
+Plan: - will use logistic regression to predict prostate cancer prevalence among subjects with two model types, one using total arsenic and the other using individual arsenic species as the exposures. Within each type, will test a full model with all covariates and a reduced model selected using a 2-stage selection procedure. Will then choose "best" models and compare between model types.
+
+## Total Arsenic
+
+NOTE: All subjects with prostate cancer will be male.
+
+First, looking at missing values in all-male subset of data:
+
+```{r}
+studysample_prostate <- studysample |>
+    filter(sex == "Male") |>
+  select(
+    prostate_cancer, arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb, acr,
+    age, ethnicity, highest_ed, smoking, bmi, diabetes,
+    hypertension, urine_cr, eGFR
+    ) 
+
+missing_prostate <- studysample_prostate |>
+  miss_var_summary() |>
+  filter(n_miss > 0)
+
+missing_prostate
+
+```
+
+All of the variables above with missing data are continuous covariates. I will assume they are missing at random and perform a multiple imputation (10 imputations) before fitting my logistic regression model to predict prostate cancer prevalence:
+
+```{r}
+set.seed(602)
+prostate_imp <- mice(studysample_prostate, m = 10)
+```
+
+Last step before fitting models, will create log-transformed representations of total arsenic, MMA, DMA, AsB, and ACR:
+
+```{r}
+imp_temp <- complete(prostate_imp, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total = log(arsenic_total),
+    log_arsenic_mma = log(arsenic_mma),
+    log_arsenic_dma = log(arsenic_dma),
+    log_arsenic_asb = log(arsenic_asb),
+    log_acr = log(acr)
+  )
+
+prostate_imp <- as.mids(imp_temp)
+```
+
+### Kitchen Sink - Total
+
+Now, I will begin fitting the models. Firstly, I will fit the group of models that use total urinary arsenic as a primary exposure, starting with a kitchen sink model that includes all covariates.
+
+Fitting the model across all imputations:
+
+```{r}
+prostate_total_full <- with(
+  prostate_imp,
+  glm(
+    prostate_cancer == "Yes" ~ log_arsenic_total + age + ethnicity + highest_ed +
+      smoking + diabetes + hypertension + bmi + log_acr + eGFR + urine_cr, 
+    family = "binomial"(link = "logit")
+  )
+)
+```
+
+Now, displaying the model summary pooled across all imputations. Will first display model coefficients as log-odds, then odds ratios:
+
+```{r}
+prostate_total_full_pool <- pool(prostate_total_full)
+kable(tidy(prostate_total_full_pool, conf.int = TRUE),
+      digits = 3)
+kable(tidy(prostate_total_full_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+
+```
+
+### Reduced Model - Total
+
+I will now select a more parsimonious model from the full set of predictors used to predict prostate cancer, to see if I can find a less complex model with better/comparable performance to the kitchen sink model. To do so, I will employ a selection procedure involving AIC-based backward elimination.
+
+Firstly, I will define total arsenic, age, and ethnicity as mandatory variables that should be included in my final models, with the former being the main exposure, and the latter 2 being retained as key demographic variables.
+
+```{r}
+forced_vars <- c("log_arsenic_total", "age", "ethnicity")
+```
+
+Next, I will perform backward elimination within each imputed fit of my kitchen sink model, after which I will keep the covariates present in 60% or more of all imputations (i.e. 6 or more out of 10 models):
+
+```{r}
+selected_models <- lapply(prostate_total_full$analyses, function(m) {
+  step(m, direction = "backward", k = 2, trace = FALSE)
+})
+
+selected_terms <- lapply(selected_models, function(m) {
+  attr(terms(m), "term.labels")
+})
+```
+
+```{r}
+table_terms <- table(unlist(selected_terms))
+stable_vars <- names(table_terms[table_terms >= 0.6 * length(selected_terms)])
+
+final_vars <- unique(c(forced_vars, stable_vars))
+final_vars
+```
+
+The variables above are the final predictors retained after backward selection, including the forced variables and all candidate covariates meeting the stability rule of being present in 60% or more of all imputations. As shown above, out of the candidate covariates, education status, smoking status, eGFR, and urinary creatinine were retained; ACR, diabetes status, bmi and hypertension were excluded.
+
+I will now fit my final reduced model across all imputed data sets using the selected variables:
+
+```{r}
+prostate_total_reduced <- with(
+  prostate_imp,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_total + age + ethnicity + 
+    highest_ed + smoking + eGFR + urine_cr, family = "binomial"(link = "logit"))
+)
+```
+
+Finally, I will display the reduced model coefficients below as log-odds, then odds ratios:
+
+```{r}
+prostate_total_reduced_pool <- pool(prostate_total_reduced)
+kable(tidy(prostate_total_reduced_pool, conf.int = TRUE),
+      digits = 3)
+kable(tidy(prostate_total_reduced_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+```
+
+### Model Comparison - Total
+
+I will now create the final tables I plan to report in my paper, comparing the full and reduced models for predicting prostate cancer using total urinary arsenic. Here, I will obtain model parameters, compare AIC/BIC, and perform a likelihood-ratio test (LRT) between the two models.
+
+```{r}
+# Helper functions for creating output tables
+
+fmt_or_ci <- function(x) {
+  sapply(x, function(v) {
+    if (is.na(v)) return(NA_character_)
+    fixed <- sprintf("%.3f", v)
+    if (fixed %in% c("0.000", "-0.000")) sprintf("%.3e", v) else fixed
+  })
+}
+
+format_pvalue <- function(x) {
+  ifelse(x < 0.001, "< .001", sprintf("%.3f", x))
+}
+```
+
+Coefficient Estimates:
+
+```{r}
+# Full Model
+prostate_total_full_effects <- tidy(prostate_total_full_pool, conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+  select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Total Arsenic - Full Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No; hypertension = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+
+prostate_total_full_effects
+
+#(prostate_total_full_effects, "prostate_total_full_effects.png")
+```
+
+```{r}
+# Reduced Model
+prostate_total_reduced_effects <- tidy(prostate_total_reduced_pool, conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+    select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Total Arsenic - Reduced Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_total_reduced_effects
+
+#(prostate_total_reduced_effects, "prostate_total_reduced_effects.png")
+```
+
+Likelihood Ratio Test:
+
+```{r}
+mice::D3(prostate_total_full, prostate_total_reduced) 
+
+lrt_prostate_total <- tibble(
+  delta_df = 5,
+  statistic = c(0.7172286),
+  p = c(0.6103951)
+) |>
+  gt(rowname_col = "row") |> 
+  fmt_number(decimals = 3) |> 
+  cols_add(
+    comparison = c("Total Arsenic: Full vs. Reduced"),
+    .before = delta_df
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(delta_df, statistic, p)
+  ) |>
+  cols_label(
+    comparison = md("Models"),
+    delta_df = md("&Delta;df"),
+    statistic = md("&chi;<sup>2</sup>"),
+    p = md("*p*") 
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Total Arsenic - Likelihood Ratio Test") 
+
+lrt_prostate_total
+
+#(lrt_prostate_total, "lrt_prostate_total.png")
+```
+
+ICs Median + Range:
+
+```{r}
+get_ic <- function(fits) {
+  sapply(1:length(fits$analyses), function(i) {
+    m <- fits$analyses[[i]]
+    c(AIC = AIC(m), BIC = BIC(m))
+  })
+}
+
+prostate_total_full_ic  <- get_ic(prostate_total_full)
+prostate_total_reduced_ic <- get_ic(prostate_total_reduced)
+
+prostate_tidy_ic <- bind_rows(
+  tibble(
+    model = "Full - Total Arsenic",
+    metric = rownames(prostate_total_full_ic),
+    min = apply(prostate_total_full_ic, 1, base::min),
+    median = apply(prostate_total_full_ic, 1, median),
+    max = apply(prostate_total_full_ic, 1, base::max)
+  ),
+  tibble(
+    model = "Reduced - Total Arsenic",
+    metric = rownames(prostate_total_reduced_ic),
+    min = apply(prostate_total_reduced_ic, 1, base::min),
+    median = apply(prostate_total_reduced_ic, 1, median),
+    max = apply(prostate_total_reduced_ic, 1, base::max)
+  )
+)
+
+prostate_ic_compact <- prostate_tidy_ic |>
+  mutate(
+    summary = sprintf(
+      "%.1f [%.1f–%.1f]",
+      median, min, max
+    )
+  ) |>
+  select(model, metric, summary) |>
+  pivot_wider(
+    names_from = metric,
+    values_from = summary
+  ) |>
+  gt() |> 
+  cols_align(
+        align = "center",
+        columns = c(AIC, BIC)
+    ) |>
+  cols_label(
+    model = "Model"
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Total Arsenic - Model Information Criteria")
+
+
+prostate_ic_compact
+
+#(prostate_ic_compact, "prostate_ic_compact.png")
+
+```
+
+## Speciated Arsenic
+
+Next, I will fit the group of models that use individual arsenic species (monomethylarsonic acid, dimethylarsonic acid, arsenobetaine) as primary exposures.
+
+### Kitchen Sink - Speciated
+
+First fitting a kitchen sink model with all predictors, across all imputations of the study sample:
+
+```{r}
+prostate_speciated_full <- with(
+  prostate_imp,
+  glm(
+    prostate_cancer == "Yes" ~ log_arsenic_mma + log_arsenic_dma + log_arsenic_asb + age + ethnicity + highest_ed + smoking + diabetes + hypertension + bmi + log_acr + eGFR + urine_cr, 
+    family = "binomial"(link = "logit")
+  )
+)
+```
+
+Now, displaying the model summary pooled across all imputations. Will first display model coefficients as log-odds, then odds ratios:
+
+```{r}
+prostate_speciated_full_pool <- pool(prostate_speciated_full)
+kable(tidy(prostate_speciated_full_pool, conf.int = TRUE),
+      digits = 3)
+kable(tidy(prostate_speciated_full_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+```
+
+### Reduced Model - Speciated
+
+Now, I will perform the same reduced model selection procedure for predicting prostate cancer w/ arsenic species.
+
+First, defining forced variables (all arsenic exposures, age, ethnicity) and performing backward selection within each imputed kitchen sink model:
+
+```{r}
+forced_vars <- c("log_arsenic_mma", "log_arsenic_dma", "log_arsenic_asb", "age", "ethnicity")
+
+selected_models <- lapply(prostate_speciated_full$analyses, function(m) {
+  step(m, direction = "backward", k = 2, trace = FALSE)
+})
+
+selected_terms <- lapply(selected_models, function(m) {
+  attr(terms(m), "term.labels")
+})
+
+```
+
+Now applying the stability rule to select for covariates included in 60% or more of all imputed fits:
+
+```{r}
+table_terms <- table(unlist(selected_terms))
+stable_vars <- names(table_terms[table_terms >= 0.6 * length(selected_terms)])
+
+final_vars <- unique(c(forced_vars, stable_vars))
+final_vars
+```
+
+Fitting the reduced model with the final set of selected predictors shown above:
+
+```{r}
+prostate_speciated_reduced <- with(
+  prostate_imp,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_mma + log_arsenic_dma + log_arsenic_asb + age + ethnicity + 
+    highest_ed + smoking + eGFR + urine_cr, family = "binomial"(link = "logit"))
+)
+```
+
+Finally, I will display the reduced model coefficients below as log-odds, then odds ratios:
+
+```{r}
+prostate_speciated_reduced_pool <- pool(prostate_speciated_reduced)
+kable(tidy(prostate_speciated_reduced_pool, conf.int = TRUE),
+      digits = 3)
+kable(tidy(prostate_speciated_reduced_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+```
+
+### Model Comparison - Speciated
+
+I will now create the final tables I plan to report in my paper, this time comparing the full and reduced models for predicting prostate cancer using individual arsenic species. Here, I will obtain model parameters, compare AIC/BIC, and perform a likelihood-ratio test (LRT) between the two models. 
+
+Coefficient Estimates:
+
+```{r}
+# Full Model
+prostate_speciated_full_effects <- tidy(prostate_speciated_full_pool, conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+  select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Speciated Arsenic - Full Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No; hypertension = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_speciated_full_effects
+
+#(prostate_speciated_full_effects, "prostate_speciated_full_effects.png")
+```
+
+```{r}
+# Reduced Model
+prostate_speciated_reduced_effects <- tidy(prostate_speciated_reduced_pool, conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Speciated Arsenic - Reduced Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_speciated_reduced_effects
+
+#(prostate_speciated_reduced_effects, "prostate_speciated_reduced_effects.png")
+```
+
+Likelihood Ratio Test:
+
+```{r}
+mice::D3(prostate_speciated_full, prostate_speciated_reduced) 
+
+lrt_prostate_speciated <- tibble(
+  delta_df = 5,
+  statistic = c(0.5465986),
+  p = c(0.7410678)
+) |>
+  gt(rowname_col = "row") |> 
+  fmt_number(decimals = 3) |> 
+  cols_add(
+    comparison = c("Speciated Arsenic: Full vs. Reduced"),
+    .before = delta_df
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(delta_df, statistic, p)
+  ) |>
+  cols_label(
+    comparison = md("Models"),
+    delta_df = md("&Delta;df"),
+    statistic = md("&chi;<sup>2</sup>"),
+    p = md("*p*") 
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Speciated Arsenic - Likelihood Ratio Test") 
+
+
+lrt_prostate_speciated
+
+#(lrt_prostate_speciated, "lrt_prostate_speciated.png")
+```
+
+ICs Median + Range:
+
+```{r}
+
+prostate_speciated_full_ic  <- get_ic(prostate_speciated_full)
+prostate_speciated_reduced_ic <- get_ic(prostate_speciated_reduced)
+
+prostate_tidy_ic <- bind_rows(
+  tibble(
+    model = "Full - Speciated Arsenic",
+    metric = rownames(prostate_speciated_full_ic),
+    min = apply(prostate_speciated_full_ic, 1, base::min),
+    median = apply(prostate_speciated_full_ic, 1, median),
+    max = apply(prostate_speciated_full_ic, 1, base::max)
+  ),
+  tibble(
+    model = "Reduced - Speciated Arsenic",
+    metric = rownames(prostate_speciated_reduced_ic),
+    min = apply(prostate_speciated_reduced_ic, 1, base::min),
+    median = apply(prostate_speciated_reduced_ic, 1, median),
+    max = apply(prostate_speciated_reduced_ic, 1, base::max)
+  )
+)
+
+prostate_speciated_ic_compact <- prostate_tidy_ic |>
+  mutate(
+    summary = sprintf(
+      "%.1f [%.1f–%.1f]",
+      median, min, max
+    )
+  ) |>
+  select(model, metric, summary) |>
+  pivot_wider(
+    names_from = metric,
+    values_from = summary
+  ) |>
+  gt() |> 
+  cols_align(
+        align = "center",
+        columns = c(AIC, BIC)
+    ) |>
+  cols_label(
+    model = "Model"
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "Prostate Cancer w/ Speciated Arsenic - Model Information Criteria")
+
+prostate_speciated_ic_compact
+
+#(prostate_speciated_ic_compact, "prostate_speciated_ic_compact.png")
+```
+
+## Total vs. Speciated Arsenic
+
+### Final Tables
+
+I will now compare the best models using total vs. speciated arsenic as primary exposures. For both model types, the reduced models with fewer predictors were more favorable, as determined by IC statistics and LRT. I will now compare IC statistics between these two models, as well as their validated ROC/AUC.
+
+ROC Curves w/ median AUC:
+
+```{r width = 14, height = 8}
+get_roc <- function(model) {
+  y <- model$y
+  if (is.null(y)) {
+    y <- model.response(model.frame(model))
+  }
+
+  p_hat <- predict(model, type = "response")
+
+  roc(y, p_hat, quiet = TRUE)
+}
+
+roc_total <- lapply(prostate_total_reduced$analyses, get_roc)
+roc_speciated <- lapply(prostate_speciated_reduced$analyses, get_roc)
+
+auc_total <- sapply(roc_total, auc)
+auc_speciated <- sapply(roc_speciated, auc)
+
+median_auc_total <- median(auc_total)
+median_auc_speciated <- median(auc_speciated)
+
+median_total_idx <- which.min(abs(auc_total - median(auc_total)))
+median_speciated_idx <- which.min(abs(auc_speciated - median(auc_speciated)))
+
+par(mfrow = c(1, 2))
+windowsFonts(A = windowsFont("Times New Roman"))  
+
+# Full
+plot(roc_total[[1]], family = "A", col = "grey70", lwd = 1, 
+     main = sprintf("Total Arsenic (Median AUC = %.4f)", median_auc_total),
+     cex.main=1
+)
+for (i in 2:length(roc_total)) lines(roc_total[[i]], col = "grey70", lwd = 1)
+lines(roc_total[[median_total_idx]], col = "black", lwd = 3)
+
+# Reduced
+plot(roc_speciated[[1]], family = "A", col = "grey70", lwd = 1, 
+     main = sprintf("Speciated Arsenic (Median AUC = %.4f)", median_auc_speciated),
+     cex.main=1
+     
+)
+for (i in 2:length(roc_speciated)) lines(roc_speciated[[i]], col = "grey70", lwd = 1)
+lines(roc_speciated[[median_speciated_idx]], col = "black", lwd = 3)
+
+
+par(mfrow = c(1, 1))
+
+```
+
+Performance Statistics (Median + Range):
+
+```{r}
+nagelkerke_r2 <- function(m) {
+  ll_full <- as.numeric(logLik(m))
+  ll_null <- as.numeric(logLik(update(m, . ~ 1)))
+  n <- length(m$y)
+  
+  (1 - exp((2 / n) * (ll_null - ll_full))) /
+    (1 - exp((2 / n) * ll_null))
+}
+
+
+get_perf <- function(fits) {
+  sapply(seq_along(fits$analyses), function(i) {
+    m <- fits$analyses[[i]]
+    
+    y <- m$y
+    if (is.null(y)) {
+      y <- model.response(model.frame(m))
+    }
+    
+    p <- predict(m, type = "response")
+    
+    roc_obj <- pROC::roc(y, p, quiet = TRUE)
+    
+    c(
+      Nagelkerke_R2 = nagelkerke_r2(m),
+      AUC = as.numeric(pROC::auc(roc_obj))
+    )
+  })
+}
+
+
+
+# Binding performance metrics w/ ICs calculated earlier
+prostate_total_perf  <- get_perf(prostate_total_reduced)
+prostate_speciated_perf <- get_perf(prostate_speciated_reduced)
+
+prostate_total_all <- rbind(prostate_total_reduced_ic, prostate_total_perf)
+prostate_speciated_all <- rbind(prostate_speciated_reduced_ic, prostate_speciated_perf)
+
+# Summarizing w/ median + range
+prostate_tidy_metrics <- bind_rows(
+  tibble(
+    model = "Total",
+    metric = rownames(prostate_total_all),
+    min = apply(prostate_total_all, 1, base::min, na.rm = TRUE),
+    median = apply(prostate_total_all, 1, median, na.rm = TRUE),
+    max = apply(prostate_total_all, 1, base::max, na.rm = TRUE)
+  ),
+  tibble(
+    model = "Speciated",
+    metric = rownames(prostate_speciated_all),
+    min = apply(prostate_speciated_all, 1, base::min, na.rm = TRUE),
+    median = apply(prostate_speciated_all, 1, median, na.rm = TRUE),
+    max = apply(prostate_speciated_all, 1, base::max, na.rm = TRUE)
+  )
+)
+
+# Constructing table
+
+prostate_metrics_compact <- prostate_tidy_metrics |>
+  mutate(
+    summary = sprintf(
+      "%.3f [%.3f–%.3f]",
+      median, min, max
+    )
+  ) |>
+  select(model, metric, summary) |>
+  pivot_wider(
+    names_from = metric,
+    values_from = summary
+  ) |>
+  gt() |> 
+  cols_align(
+        align = "center",
+        columns = c(AIC, BIC, AUC, Nagelkerke_R2)
+    ) |>
+  cols_label(
+    model = "Model",
+    Nagelkerke_R2 = md("Nagelkerke R<sup>2</sup>")
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("Prostate Cancer – Total vs. Speciated Arsenic <br> Model  Performance"))
+
+prostate_metrics_compact
+#(prostate_metrics_compact, "prostate_metrics_compact.png")
+```
+
+
+# All-Cause Mortality Analysis
+
+## Total Arsenic
+
+Will now conduct Cox regression analyses to determine associations of predictors with all-cause mortality in my study sample. I will follow the same framework, where I fit models using either total urinary arsenic or the individual arsenic species as the primary exposures. For each group, I will fit a kitchen sink model using all covariates, then check proportional hazards and adjust the model as needed until compliant.
+
+Firstly, subsetting my study sample again to include all subjects, covariates, and the all-cause mortality outcome:
+
+```{r}
+studysample_mort <- studysample |>
+  select(
+    mort_status, arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb, acr,
+    age, sex, ethnicity, highest_ed, smoking, bmi, diabetes,
+    hypertension, urine_cr, eGFR, NHANES_ID, PERMTH_EXM, 
+    ) 
+
+missing_mort <- studysample_mort |>
+  miss_var_summary() |>
+  filter(n_miss > 0)
+
+missing_mort
+```
+
+As with the prostate cancer subsample, the same covariates are missing, so I will perform 10 imputations with the same seed to manage them:
+
+```{r}
+set.seed(602)
+mort_imp <- mice(studysample_mort, m = 10)
+```
+
+Last step before fitting models, will create log-transformed representations of total arsenic, MMA, DMA, AsB, and ACR:
+
+```{r}
+imp_temp <- complete(mort_imp, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total = log(arsenic_total),
+    log_arsenic_mma = log(arsenic_mma),
+    log_arsenic_dma = log(arsenic_dma),
+    log_arsenic_asb = log(arsenic_asb),
+    log_acr = log(acr)
+  )
+
+mort_imp <- as.mids(imp_temp)
+```
+
+
+### Kitchen Sink - Total
+
+Now, I will fit a full cox proportional hazards model with all predictors, and using only total arsenic as the primary exposure, across each imputed dataset:
+
+```{r}
+cox_all_total <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_total + age + sex + ethnicity + highest_ed + smoking + diabetes + hypertension + bmi + log_acr + eGFR + urine_cr))
+```
+
+Pooled results across imputations, exponentiated to show hazards ratios, 95% CIs, Wald test p-values:
+
+```{r}
+cox_all_total_pool <- pool(cox_all_total)
+
+
+kable(tidy(cox_all_total_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+```
+
+### Proportional Hazards - Total
+
+I now want to assess the proportional hazards assumption for my model. While I can check proportional hazards within each imputed dataset, there is no formally pooled PH test for Cox MI models in R, so I will have to check the PH assumption on each model and compare for consistency.
+
+```{r}
+ph_tests <- lapply(cox_all_total$analyses, cox.zph)
+
+pval_list <- lapply(ph_tests, function(zph){
+  zph$table[, "p"]
+})
+
+ph_pvals_mat <- do.call(cbind, pval_list)
+
+viol_prop <- rowMeans(ph_pvals_mat < 0.05, na.rm = TRUE)
+viol_prop
+```
+
+The table above summarizes the p-values for the global and per-variable PH tests across all 10 imputed datasets, showing the proportion of imputations where each variable violated proportional hazards (meaning the p-value was less than 0.05).
+
+I am going to use these values to determine if a variable has a strong case for non-proportional hazards due to consistent, systematic violation across all imputations, then further investigate said variables using Schoenfeld residuals.
+
+Looking at the table above, it seems that age, bmi, and hypertension show evidence of consistent violation, so it is clear to me that they have effects that are time-varying. eGFR however, is borderline/inconsistent.
+
+Because age, bmi, and hypertension are not key exposures of interest in this study, I think the simplest way to address clear non-proportional hazards in them will be through stratification, instead of including a time interaction.
+
+While hypertension is categorical, age and bmi are not, so to stratify by all 3 I will create categorical representations for the latter two. Firstly, for age, I will use these cutpoints sourced from WHO:
+
+-   Young adults = 20-24
+-   Adults = 25-59
+-   Older adults = 60+
+
+Next, for BMI, I will use these CDC-established cutpoints:
+
+-   Underweight = \<18.5
+-   Healthy Weight = 18.5 to \<25
+-   Overweight = 25 to \<30
+-   Obese = 30+
+
+Now, creating the new categorical variables:
+
+```{r}
+mort_imp_temp <- complete(mort_imp, action="long", include = TRUE)
+mort_imp_temp <- mort_imp_temp |>
+  mutate(
+    age_cat = case_when(
+      age < 25 ~ "YoungAdult",
+      age >= 25 & age < 60 ~ "Adult",
+      age >= 60 ~ "OlderAdult"
+    ),
+    bmi_cat = case_when(
+      bmi < 18.5 ~ "Underweight",
+      bmi >= 18.5 & bmi < 25 ~ "HealthyWeight",
+      bmi >= 25 & bmi < 30 ~ "Overweight",
+      bmi >= 30 ~ "Obesity" 
+    )
+  )
+
+mort_imp <- as.mids(mort_imp_temp)
+```
+
+Now, refitting the cox model for all-cause mortality wile stratifying by hypertension, age, and BMI:
+
+```{r}
+cox_all_total_strat <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_total + 
+                          sex + ethnicity + 
+                          highest_ed + smoking +  diabetes +
+                          log_acr + eGFR + urine_cr +
+                          strata(hypertension, age_cat, bmi_cat)))
+```
+
+Evaluating proportional hazards for the new model:
+
+```{r}
+ph_tests <- lapply(cox_all_total_strat$analyses, cox.zph)
+
+pval_list <- lapply(ph_tests, function(zph){
+  zph$table[, "p"]
+})
+
+ph_pvals_mat <- do.call(cbind, pval_list)
+
+viol_prop <- rowMeans(ph_pvals_mat < 0.05, na.rm = TRUE)
+viol_prop
+```
+
+Now looking above, we can see that no variables violate proportional hazards across a single imputation. Because of this, we can go ahead with the stratified model as our final model for all-cause mortality, using total arsenic.
+
+### Final Model - Total
+
+Now, reporting hazards ratios, 95% CIs, Wald test p-values for final stratified model:
+
+```{r}
+cox_all_total_pool <- pool(cox_all_total_strat) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "All-Cause Mortality w/ Total Arsenic - Cox Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+  
+
+cox_all_total_pool
+
+##(cox_all_total_pool, "cox_all_total_effects.png")
+```
+
+## Speciated Arsenic
+
+### Kitchen Sink - Speciated
+
+Now, I will fit a full cox proportional hazards model with all predictors, this time using the individual arsenic species as the primary exposures, across each imputed dataset:
+
+```{r}
+cox_all_speciated <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_mma + log_arsenic_dma + log_arsenic_asb + age + sex + ethnicity + highest_ed + smoking + diabetes + hypertension + bmi + log_acr + eGFR + urine_cr))
+```
+
+Pooled results across imputations, exponentiated to show hazards ratios, 95% CIs, Wald test p-values:
+
+```{r}
+cox_all_speciated_pool <- pool(cox_all_speciated)
+
+
+kable(tidy(cox_all_speciated_pool, exponentiate = TRUE, conf.int = TRUE),
+      digits = 3)
+```
+
+### Proportional Hazards - Speciated
+
+Will now evaluate the proportional hazards assumption for my Cox model w/ individual arsenic species:
+
+```{r}
+ph_tests <- lapply(cox_all_speciated$analyses, cox.zph)
+
+pval_list <- lapply(ph_tests, function(zph){
+  zph$table[, "p"]
+})
+
+ph_pvals_mat <- do.call(cbind, pval_list)
+
+viol_prop <- rowMeans(ph_pvals_mat < 0.05, na.rm = TRUE)
+viol_prop
+```
+
+It looks like age, bmi, and hypertension are clearly in violation of PH again, this time exhibiting such a property across all 10 imputed models. Again, eGFR also appears to be borderline, but not definitively in violation.
+
+I will go ahead and stratify the kitchen sink model again by age, bmi, and hypertension, using the categorical representations of the former 2 created earlier.
+
+Fitting the new stratified model and assessing PH:
+
+```{r}
+cox_all_speciated_strat <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_mma + log_arsenic_dma + log_arsenic_asb + sex + ethnicity + highest_ed + smoking + diabetes + log_acr + eGFR + urine_cr +
+                          strata(hypertension, age_cat, bmi_cat)))
+```
+
+```{r}
+ph_tests <- lapply(cox_all_speciated_strat$analyses, cox.zph)
+
+pval_list <- lapply(ph_tests, function(zph){
+  zph$table[, "p"]
+})
+
+ph_pvals_mat <- do.call(cbind, pval_list)
+
+viol_prop <- rowMeans(ph_pvals_mat < 0.05, na.rm = TRUE)
+viol_prop
+```
+
+All variables seem to be compliant, so I will keep this as my final model.
+
+### Final Model - Speciated
+
+Now, reporting hazards ratios, 95% CIs, Wald test p-values for final model:
+
+```{r}
+cox_all_speciated_pool <- pool(cox_all_speciated_strat) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = "All-Cause Mortality w/ Speciated Arsenic - Cox Model Parameters") |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+cox_all_speciated_pool
+
+##(cox_all_speciated_pool, "cox_all_speciated_effects.png")
+```
+
+## Total vs. Speciated Arsenic
+
+### Comparison Tables
+
+Comparing model performance:
+
+```{r}
+get_c <- function(fits) {
+  sapply(seq_along(fits$analyses), function(i) {
+    m <- fits$analyses[[i]]
+
+    
+    sum <- as.vector(summary(m)$concordance)
+    
+    c(
+      C = sum[1],
+      SE = sum[2]
+    )
+  })
+}
+
+cox_total_g <- get_c(cox_all_total_strat)
+cox_speciated_g <- get_c(cox_all_speciated_strat)
+
+cox_total_ic  <- get_ic(cox_all_total_strat)
+cox_speciated_ic <- get_ic(cox_all_speciated_strat)
+
+cox_total_perf <- rbind(cox_total_ic, cox_total_g)
+cox_speciated_perf <- rbind(cox_speciated_ic, cox_speciated_g)
+
+cox_tidy_metrics <- bind_rows(
+  tibble(
+    model = "Total Arsenic",
+    metric = rownames(cox_total_perf),
+    min = apply(cox_total_perf, 1, base::min),
+    median = apply(cox_total_perf, 1, median),
+    max = apply(cox_total_perf, 1, base::max)
+  ),
+  tibble(
+    model = "Speciated Arsenic",
+    metric = rownames(cox_speciated_perf),
+    min = apply(cox_speciated_perf, 1, base::min),
+    median = apply(cox_speciated_perf, 1, median),
+    max = apply(cox_speciated_perf, 1, base::max)
+  )
+)
+
+cox_metrics_compact <- cox_tidy_metrics |>
+  mutate(
+    summary = sprintf(
+      "%.3f [%.3f–%.3f]",
+      median, min, max
+    )
+  ) |>
+  select(model, metric, summary) |>
+  pivot_wider(
+    names_from = metric,
+    values_from = summary
+  ) |>
+  gt() |> 
+  cols_align(
+        align = "center",
+        columns = c(AIC, BIC, C, SE)
+    ) |>
+  cols_label(
+    model = "Model",
+    C = md("*C*"),
+    SE = md("*SE*(*C*)")
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("All-Cause Mortality - Total vs. Speciated Arsenic <br> Cox Model  Performance"))
+
+
+cox_metrics_compact
+
+##(cox_metrics_compact, "cox_metrics_compact.png")
+```
+
+
+# Sensitivity Analyses
+
+Study question: Do my substantative conclusions change under reasonable alternative assumptions?
+
+Sensitivity Analysis 1 - Creatinine-corrected arsenic
+
+-   Primary models will use arsenic exposures with urinary creatinine as a covariate
+
+-   sensitivity analysis will fit models with creatinine-corrected arsenic values, i.e. arsenic/creatinine, and remove urinary creatinine as a covariate
+
+-   Looking for:
+
+-   directional consistency
+
+-   stability, comparability of point estimates
+
+-   uncertainty --- change in CIs, expected but what changed
+
+Sensitivity Analysis 2 - Extreme urinary dilution:
+
+-   Primary models will include all eligible subjects without regarding creatinine values
+
+-   sensitivity analyses will exclude subjects with abnormal creatinine levels that could possibly affect dilution, i.e. less than 30 mg/dL or greater than 300 mg/dL
+
+-   Looking for:
+
+-   sample size change --- how many observations removed, implications of this
+
+-   stability --- similarity of point estimates
+
+-   direction of association --- any sign reversals
+
+-   uncertainty --- change in CIs, expected but what changed
+
+## Creatinine-Corrected Arsenic
+
+My first set of sensitivity analyses concerns the representation of urinary arsenic in my models. My primary models utilize urinary arsenic concentrations as obtained from NHANES, with urinary creatinine as a covariate to represent the influence of dilution on the arsenic exposures and subsequently the outcomes. This approach assumes a linear and additive relationship to some extent, between creatinine, arsenic, and the outcomes.
+
+I want to asssess the robustness of my findings to this assumption, by fitting my models again using creatinine-corrected arsenic concentrations as my primary exposures, while excluding creatinine as a covariate. While creatinine serves as an proxy for urine dilution, it also has biological significance and could have an effect on the outcome, so I want to determine if it behaves more like a nuisance variable or a structural component of the primary exposures.
+
+### Corrected Arsenic - Prostate Cancer
+
+As stated earlier, my primary models used arsenic measurements (ug/L) as primary exposures and urinary creatinine (mg/dL) as a covariate. Now, I will refit these models using the creatinine-corrected arsenic measurements in ug/g as the primary exposures, while removing urinary creatinine as a covariate.
+
+I will first refit the logistic regression models I used to predict prostate cancer. Specifically, I will be refitting the reduced models using total arsenic and speciated arsenic, as they were determined to be superior than their "kitchen-sink" counterparts.
+
+Obtaining and log-transforming the creatinine-corrected values for arsenic:
+
+```{r}
+imp_temp <- complete(prostate_imp, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total_cr = log(arsenic_total/urine_cr),
+    log_arsenic_mma_cr = log(arsenic_mma/urine_cr),
+    log_arsenic_dma_cr = log(arsenic_dma/urine_cr),
+    log_arsenic_asb_cr = log(arsenic_asb/urine_cr)
+  )
+
+prostate_imp <- as.mids(imp_temp)
+```
+
+Now fitting the reduced prostate cancer models, using the corrected arsenic values and removing urinary creatinine as a covariate:
+
+```{r}
+# Total
+prostate_total_cr <- with(
+  prostate_imp,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_total_cr + age + ethnicity + 
+    highest_ed + smoking + eGFR, family = "binomial"(link = "logit"))
+)
+
+#Speciated
+prostate_speciated_cr <- with(
+  prostate_imp,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_mma_cr + log_arsenic_dma_cr + log_arsenic_asb_cr + age + ethnicity + 
+    highest_ed + smoking + eGFR, family = "binomial"(link = "logit"))
+)
+
+```
+
+Effect sizes for total arsenic:
+
+```{r}
+prostate_total_cr_effects <- tidy(pool(prostate_total_cr), conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+    select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("Prostate Cancer w/ Total Arsenic -<br> Creatinine-Corrected Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_total_cr_effects
+
+#(prostate_total_cr_effects, "prostate_total_cr_effects.png")
+```
+
+
+Effect sizes for speciated arsenic:
+
+```{r}
+prostate_speciated_cr_effects <- tidy(pool(prostate_speciated_cr), conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+    select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("Prostate Cancer w/ Speciated Arsenic -<br> Creatinine-Corrected Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_speciated_cr_effects
+
+#(prostate_speciated_cr_effects, "prostate_speciated_cr_effects.png")
+```
+
+
+### Corrected Arsenic - All-Cause Mortality
+
+Now, I will refit the Cox models using total vs. speciated arsenic, to predict all-cause mortality.
+
+First, obtaining and log-transforming arsenic values in the full imputed study sample:
+
+```{r}
+imp_temp <- complete(mort_imp, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total_cr = log(arsenic_total/urine_cr),
+    log_arsenic_mma_cr = log(arsenic_mma/urine_cr),
+    log_arsenic_dma_cr = log(arsenic_dma/urine_cr),
+    log_arsenic_asb_cr = log(arsenic_asb/urine_cr)
+  )
+
+mort_imp <- as.mids(imp_temp)
+```
+
+Next, refitting the final stratified Cox models for predicting all-cause mortality using total and speciated arsenic (with corrrected arsenic, no urinary creatinine):
+
+```{r}
+# Total
+cox_total_cr <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_total_cr + 
+                          sex + ethnicity + 
+                          highest_ed + smoking +  diabetes +
+                          log_acr + eGFR + 
+                          strata(hypertension, age_cat, bmi_cat)))
+
+# Speciated
+cox_speciated_cr <- with(mort_imp,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_mma_cr + 
+                          log_arsenic_dma_cr + log_arsenic_asb_cr + sex + ethnicity + 
+                          highest_ed + smoking + diabetes + 
+                          log_acr + eGFR +
+                          strata(hypertension, age_cat, bmi_cat)))
+```
+
+Hazard ratios for total arsenic:
+
+```{r}
+cox_total_cr_effects <- pool(cox_total_cr) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("All-Cause Mortality w/ Total Arsenic - <br>Creatine-Corrected Cox Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+cox_total_cr_effects
+
+#(cox_total_cr_effects, "cox_total_cr_effects.png")
+```
+
+
+Hazard ratios for speciated arsenic:
+
+```{r}
+cox_speciated_cr_effects <- pool(cox_speciated_cr) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("All-Cause Mortality w/ Speciated Arsenic - <br>Creatine-Corrected Cox Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+cox_speciated_cr_effects
+
+#(cox_speciated_cr_effects, "cox_speciated_cr_effects.png")
+```
+
+
+## Extreme Urinary Dilution
+
+My second set of sensitivity analyses concerns subjects with extreme urinary dilution, meaning that they have recorded urinary creatinine levels that are considered "abnormal". For the analyses, I will exclude all subjects with urinary creatinine levels \< 20 mg/dL or \> 300 mg/dL from my sample before refitting all primary models for comparison.
+
+Because urinary creatinine is a standard for urine dilution, abnormally low or high values could indicate extremely dilute or concentrated urine samples, respectively, which could lead to misrepresentation of other species' measurements (i.e. arsenic). Additionally, creatinine extremes could indicate some underlying pathology that could conflate measurements of the primary exposures with true biological risk.
+
+### Dilution - Prostate Cancer
+
+I will first fit my prostate cancer models to the new sample, post-exclusion. Specifically, I will be fitting the reduced models using total arsenic and speciated arsenic, as they were determined to be superior than their "kitchen-sink" counterparts.
+
+First, I will exclude subjects with urinary creatinine values less than 30 or greater than 300 mg/dL from my sample, before performing multiple imputation:
+
+```{r}
+studysample_prostate_ex <- studysample_prostate |>
+  filter(urine_cr >= 30 & urine_cr <= 300)
+
+nrow(studysample_prostate)
+nrow(studysample_prostate_ex)
+nrow(studysample_prostate) - nrow(studysample_prostate_ex)
+(nrow(studysample_prostate) - nrow(studysample_prostate_ex))/nrow(studysample_prostate) * 100
+```
+
+As shown above, from the population of males in my study sample, 597 subjects or 8.8% of the males in my sample were removed on account of abnormal urinary creatinine levels.
+
+Now, I will perform 10 imputations on my new sample:
+
+```{r}
+set.seed(602)
+prostate_imp_ex <- mice(studysample_prostate_ex, m = 10)
+```
+
+Obtaining the log-transformed predictors in the new sample:
+
+```{r}
+imp_temp <- complete(prostate_imp_ex, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total = log(arsenic_total),
+    log_arsenic_mma = log(arsenic_mma),
+    log_arsenic_dma = log(arsenic_dma),
+    log_arsenic_asb = log(arsenic_asb),
+    log_acr = log(acr)
+  )
+
+prostate_imp_ex <- as.mids(imp_temp)
+```
+
+Now, I will refit my primary prostate cancer models using the new sample:
+
+```{r}
+# Total
+prostate_total_ex <- with(
+  prostate_imp_ex,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_total + age + ethnicity + 
+    highest_ed + smoking + eGFR + urine_cr, family = "binomial"(link = "logit"))
+)
+
+# Speciated
+prostate_speciated_ex <- with(
+  prostate_imp_ex,
+  glm(prostate_cancer == "Yes" ~ log_arsenic_mma + log_arsenic_dma + log_arsenic_asb + age +       ethnicity + highest_ed + smoking + eGFR + urine_cr,
+      family = "binomial"(link = "logit"))
+)
+
+```
+
+Effect sizes for total arsenic:
+
+```{r}
+prostate_total_ex_effects <- tidy(pool(prostate_total_ex), conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+    select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("Prostate Cancer w/ Total Arsenic -<br> Dilution-Adjusted Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_total_ex_effects
+
+#(prostate_total_ex_effects, "prostate_total_ex_effects.png")
+```
+
+Effect sizes for speciated arsenic:
+
+```{r}
+prostate_speciated_ex_effects <- tidy(pool(prostate_speciated_ex), conf.int = TRUE, conf.level = 0.95) |>
+  mutate(
+    OR = exp(estimate),
+    OR_lower = exp(conf.low),
+    OR_upper = exp(conf.high)
+  ) |>
+    select(term, OR, SE = std.error,  OR_lower, OR_upper, p = p.value) |>
+  gt() |>
+  fmt(
+    columns = c(OR, SE, OR_lower, OR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("OR - 95% CI"), columns = c(OR_lower, OR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    OR = md("OR"),
+    SE = md("*SE*"),
+    OR_lower = md("*LL*"),
+    OR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(OR, SE, OR_lower, OR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("Prostate Cancer w/ Speciated Arsenic -<br> Dilution-Adjusted Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+prostate_speciated_ex_effects
+
+#(prostate_speciated_ex_effects, "prostate_speciated_ex_effects.png")
+```
+
+### Dilution - All-Cause Mortality
+
+I will now extend the same workflow to the Cox regression models fitted earlier, using total and speciated arsenic, to predict all-cause mortality. To start, I will fit the new sample to the final models obtained after correcting for non-proportional hazards in the original sample.
+
+Firstly, excluding subjects from the original full study sample:
+
+```{r}
+studysample_mort_ex <- studysample_mort |>
+  filter(urine_cr >= 30 & urine_cr <= 300)
+
+nrow(studysample_mort)
+nrow(studysample_mort_ex)
+nrow(studysample_mort) - nrow(studysample_mort_ex)
+(nrow(studysample_mort) - nrow(studysample_mort_ex))/nrow(studysample_mort) * 100
+```
+
+This time, we can see that 1427 subjects, or 10.5% of the overall sample, were excluded. This means that there were 830 additional female subjects that were excluded in addition to the males from the prostate sample.
+
+Now, performing imputation and obtaining the log-transformed predictors:
+
+```{r}
+set.seed(602)
+mort_imp_ex <- mice(studysample_mort_ex, m = 10)
+```
+
+```{r}
+imp_temp <- complete(mort_imp_ex, action="long", include = TRUE)
+imp_temp <- imp_temp |>
+  mutate(
+    log_arsenic_total = log(arsenic_total),
+    log_arsenic_mma = log(arsenic_mma),
+    log_arsenic_dma = log(arsenic_dma),
+    log_arsenic_asb = log(arsenic_asb),
+    log_acr = log(acr)
+  )
+
+mort_imp_ex <- as.mids(imp_temp)
+```
+
+Obtaining the categorical representations of age and bmi for stratification:
+
+```{r}
+mort_imp_temp <- complete(mort_imp_ex, action="long", include = TRUE)
+mort_imp_temp <- mort_imp_temp |>
+  mutate(
+    age_cat = case_when(
+      age < 25 ~ "YoungAdult",
+      age >= 25 & age < 60 ~ "Adult",
+      age >= 60 ~ "OlderAdult"
+    ),
+    bmi_cat = case_when(
+      bmi < 18.5 ~ "Underweight",
+      bmi >= 18.5 & bmi < 25 ~ "HealthyWeight",
+      bmi >= 25 & bmi < 30 ~ "Overweight",
+      bmi >= 30 ~ "Obesity" 
+    )
+  )
+
+mort_imp_ex <- as.mids(mort_imp_temp)
+```
+
+Finally, fitting the Cox models for all-cause mortality using the new sample:
+
+```{r}
+# Total
+cox_total_ex <- with(mort_imp_ex,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_total + 
+                          sex + ethnicity + 
+                          highest_ed + smoking +  diabetes +
+                          log_acr + eGFR + urine_cr +
+                          strata(hypertension, age_cat, bmi_cat)))
+
+# Speciated
+cox_speciated_ex <- with(mort_imp_ex,
+                  coxph(Surv(PERMTH_EXM, mort_status) ~ log_arsenic_mma + 
+                          log_arsenic_dma + log_arsenic_asb + sex + ethnicity + 
+                          highest_ed + smoking + diabetes + 
+                          log_acr + eGFR + urine_cr +
+                          strata(hypertension, age_cat, bmi_cat)))
+```
+
+Hazard ratios for total arsenic:
+
+```{r}
+cox_total_ex_effects <- pool(cox_total_ex) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("All-Cause Mortality w/ Total Arsenic - <br>Dilution-Adjusted Cox Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+cox_total_ex_effects
+
+#(cox_total_ex_effects, "cox_total_ex_effects.png")
+```
+
+Hazard ratios for speciated arsenic:
+
+```{r}
+cox_speciated_ex_effects <- pool(cox_speciated_ex) |>
+  tidy(conf.int = TRUE, conf.level = 0.95) |>
+   mutate(
+    HR = exp(estimate),
+    HR_lower = exp(conf.low),
+    HR_upper = exp(conf.high)
+  ) |>
+  select(term, HR, SE = std.error, HR_lower, HR_upper, p = p.value) |>
+    gt() |>
+  fmt(
+    columns = c(HR, SE, HR_lower, HR_upper),
+    fns = fmt_or_ci
+  ) |>
+  fmt(
+    columns = p,
+    fns = format_pvalue
+  ) |>
+  tab_spanner(label = md("HR - 95% CI"), columns = c(HR_lower, HR_upper)) |>
+  cols_label(
+    term = md("Term"),
+    HR = md("HR"),
+    SE = md("*SE*"),
+    HR_lower = md("*LL*"),
+    HR_upper = md("*UL*"),
+    p = md("*p*")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(HR, SE, HR_lower, HR_upper, p)
+  ) |>
+  opt_table_font(font = "Times New Roman", size = px(12)) |>
+  tab_header(title = md("All-Cause Mortality w/ Speciated Arsenic - <br>Dilution-Adjusted Cox Model Parameters")) |>
+  tab_footnote(
+    footnote = md("Reference levels for categorical predictors:
+    sex = Male; ethnicity = Mexican American; highest_ed = No HS Diploma;<br>
+    smoking = No; diabetes = No"),
+    locations = cells_column_labels(columns = term)
+  ) |>
+  tab_options(footnotes.multiline = FALSE)
+
+cox_speciated_ex_effects
+
+#(cox_speciated_ex_effects, "cox_speciated_ex_effects.png")
+```
+
+# Session Info
+
+```{r}
+xfun::session_info()
+```

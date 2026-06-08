@@ -1,0 +1,152 @@
+---
+title: "PQHS 602 - TableOne"
+author: "Manu Bulusu"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: lux
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+options(error = recover)
+
+library(janitor) 
+library(naniar)
+
+library(broom)
+library(caret)
+library(car)
+library(codebookr)
+library(mice)
+library(gt)
+library(patchwork)
+library(rms)
+library(mosaic)
+library(haven)
+library(readr)
+library(transplantr)
+library(tableone)
+library(table1)
+library(nhanesA)
+library(DescTools)
+library(webshot2)
+library(htmlwidgets)
+
+library(easystats)
+library(tidyverse) 
+
+library(conflicted)
+
+theme_set(theme_bw()) 
+```
+
+```{r}
+
+conflicted::conflicts_prefer(
+  dplyr::select,
+  dplyr::filter,
+  dplyr::rename,
+  Hmisc::`label<-`
+)
+
+```
+
+
+In this file, I will create TableOnes from my cleaned dataset with NHANES subjects from 2003-2018.
+
+# Load Data
+
+```{r}
+studydata <- readRDS("mb_602_data_final.Rds")
+```
+
+```{r}
+glimpse(studydata)
+```
+
+Relabeling predictor variables for presentation in tables:
+
+```{r}
+studydata <- studydata |>
+  mutate(
+    mort_status = factor(mort_status, levels = c(1, 0), labels = c("Event", "No Event"))
+  )
+
+label(studydata$age) <- "Age (years)"
+label(studydata$sex) <- "Sex"
+label(studydata$ethnicity) <- "Ethnicity"
+label(studydata$arsenic_total) <- "Total Urinary Arsenic (ug/L)"
+label(studydata$arsenic_mma) <- "Urinary MMA (ug/L)"
+label(studydata$arsenic_dma) <- "Urinary DMA (ug/L)"
+label(studydata$arsenic_asb) <- "Urinary AsB (ug/L)"
+label(studydata$acr) <- "Albumin-Creatinine Ratio (mg/g)"
+label(studydata$eGFR) <- "eGFR (mL/min/1.73 m^2)"
+label(studydata$highest_ed) <- "Highest Education"
+label(studydata$smoking) <- "Smoker"
+label(studydata$diabetes) <- "Diabetes"
+label(studydata$hypertension) <- "Hypertension" 
+label(studydata$bmi) <- "BMI (kg/m^2)"
+label(studydata$urine_cr) <- "Urinary Creatinine (mg/dL)"
+label(studydata$prostate_cancer) <- "Prostate Cancer"
+label(studydata$mort_status) <- "All-Cause Mortality"
+```
+
+# Prostate Cancer
+
+I will now make a Table1 stratified by each outcome, presenting all exposures and covariates.
+
+First removing all female subjects from the sample:
+
+```{r}
+studydata_prostate <- studydata |>
+  filter(sex == "Male") |>
+  select(
+    prostate_cancer, arsenic_total, arsenic_mma, arsenic_dma, arsenic_asb, acr, age, ethnicity, highest_ed, smoking, bmi, diabetes,
+    hypertension, urine_cr, eGFR
+    ) 
+```
+
+Now making the Table1 stratified by prostate cancer status:
+
+```{r}
+prostate_table1 <- table1(~ age + ethnicity + arsenic_total + arsenic_mma + arsenic_dma + arsenic_asb +
+          highest_ed + smoking + diabetes + hypertension + bmi + acr + eGFR + urine_cr | prostate_cancer, data = studydata_prostate, caption = "Prostate Cancer")
+
+```
+
+```{r}
+prostate_table1
+```
+
+
+# All-Cause Mortality
+
+Now, I will look at all-cause mortality while retaining the same variables described in the cancer-outcome tables above:
+
+```{r}
+mort_table1 <- table1(~ age + sex + ethnicity + arsenic_total + arsenic_mma + arsenic_dma + arsenic_asb +
+          highest_ed + smoking + diabetes + hypertension + bmi + acr + eGFR + urine_cr | mort_status, data = studydata, caption = "All-Cause Mortality")
+```
+
+```{r}
+mort_table1
+```
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
